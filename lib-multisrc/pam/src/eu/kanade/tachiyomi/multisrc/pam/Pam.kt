@@ -23,11 +23,11 @@ import keiyoushi.utils.parseAs
 import keiyoushi.utils.tryParseDateTime
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.asResponseBody
 import okhttp3.ResponseBody.Companion.toResponseBody
@@ -43,7 +43,6 @@ import java.util.TimeZone
 import java.util.concurrent.ConcurrentHashMap
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
-import kotlin.math.abs
 import kotlin.time.Duration.Companion.seconds
 
 abstract class Pam :
@@ -228,23 +227,20 @@ abstract class Pam :
 
     private val secureRandom = SecureRandom()
 
-    private sealed interface ChapterSession
-
     /** Reader v1: pages signed with the chapter token, streams keyed by the key exchange. */
     private class SignedSession(
         val chapterToken: String,
         val sharedSecret: ByteArray,
         val clientPubkeyB64: String,
-    ) : ChapterSession
+    )
 
-    /** Reader v2: encrypted pages under the manifest's page ticket. */
-    private class EncryptedSession(
-        val contentKey: ByteArray,
-        val siteHeaders: Headers,
-    ) : ChapterSession
-
-    private val sessions = ConcurrentHashMap<String, ChapterSession>()
+    private val sessions = ConcurrentHashMap<String, SignedSession>()
     private val sessionMutexes = ConcurrentHashMap<String, Mutex>()
+
+    // Reader v2 pages, decrypted in getPageList from what the WebView fetched, served by imageInterceptor.
+    private val decryptedPages = object : LinkedHashMap<String, ByteArray>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: Map.Entry<String, ByteArray>) = size > MAX_CACHED_PAGES
+    }
 
     private fun sessionKey(serieSlug: String, chapterSlug: String) = "${name.take(3).lowercase()}-$serieSlug--$chapterSlug"
 
@@ -263,28 +259,6 @@ abstract class Pam :
         }
     }
 
-    /** The reader v2 session and manifest from a chapter page loaded with the reader. */
-    private fun encryptedSession(site: SitePage): Pair<EncryptedSession, ReaderResult.Manifest> {
-        val result = site.reader!!
-
-        // Used in page URLs and headers
-        val manifest = result.manifest.takeIf { MANIFEST_BASE_REGEX.matches(it.base) && it.count > 0 }
-        val contentKey = runCatching { Base64.decode(result.contentKey, Base64.DEFAULT) }.getOrNull()?.takeIf { it.size == 32 }
-        if (manifest == null || contentKey == null) throw IOException("Unexpected reader result")
-        // The site's X- headers on page requests, less the WebView's X-Requested-With
-        val siteHeaders = Headers.Builder().apply {
-            site.pageHeaders
-                .filter { (name, value) ->
-                    SITE_HEADER_REGEX.matches(name) &&
-                        !name.equals("X-Requested-With", ignoreCase = true) &&
-                        HEADER_VALUE_REGEX.matches(value)
-                }
-                .forEach { (name, value) -> add(name, value) }
-        }.build()
-
-        return EncryptedSession(contentKey, siteHeaders) to manifest
-    }
-
     private suspend fun ensureSession(serieSlug: String, chapterSlug: String): SignedSession {
         val id = sessionKey(serieSlug, chapterSlug)
         (sessions[id] as? SignedSession)?.let { return it }
@@ -299,7 +273,7 @@ abstract class Pam :
     }
 
     override suspend fun getPageList(chapter: SChapter): List<Page> {
-        val site = sitePages.load("$baseUrl${chapter.url}", reader = true)
+        val site = sitePages.loadReader("$baseUrl${chapter.url}")
         val props = site.page.parseAs<PageListResponse>().props
         val id = sessionKey(props.data.serie.slug, props.data.slug)
 
@@ -314,18 +288,20 @@ abstract class Pam :
             }
         }
 
-        val (session, manifest) = encryptedSession(site)
-        sessions[id] = session
+        val reader = site.reader ?: throw IOException("Unexpected reader result")
+        val encryptedPages = site.pages ?: throw IOException("Unexpected reader result")
+        val manifest = reader.manifest.takeIf { MANIFEST_BASE_REGEX.matches(it.base) }
+            ?: throw IOException("Unexpected reader result")
+        val contentKey = runCatching { Base64.decode(reader.contentKey, Base64.DEFAULT) }
+            .getOrNull()?.takeIf { it.size == 32 } ?: throw IOException("Unexpected reader result")
+        val width = manifest.variants.first()
 
-        // Some sites list oversized variants they never serve.
-        val variant = manifest.variants.minByOrNull { abs(it - MAX_VARIANT_WIDTH) }?.let { "-$it" }.orEmpty()
-
-        return (1..manifest.count).map { idx ->
-            Page(
-                index = idx - 1,
-                url = "$id#$idx",
-                imageUrl = "$baseUrl${manifest.base}$idx$variant.ece#$id",
-            )
+        return encryptedPages.mapIndexed { index, encrypted ->
+            val imageUrl = "$baseUrl${manifest.base}${index + 1}-$width.ece"
+            synchronized(decryptedPages) {
+                decryptedPages[imageUrl] = Ece.decrypt(encrypted, contentKey)
+            }
+            Page(index = index, url = "$id#${index + 1}", imageUrl = "$imageUrl#$id")
         }
     }
 
@@ -374,27 +350,29 @@ abstract class Pam :
 
     private fun imageInterceptor(chain: Interceptor.Chain): Response {
         val request = chain.request()
-        val session = request.url.fragment?.let(sessions::get) ?: return chain.proceed(request)
 
-        return when (session) {
-            is EncryptedSession -> encryptedPage(chain, session)
-            is SignedSession -> signedPage(chain, session)
+        // Reader v2 pages were fetched and decrypted in getPageList; serve them without touching /p/.
+        val cached = synchronized(decryptedPages) {
+            decryptedPages.remove(request.url.newBuilder().fragment(null).build().toString())
         }
-    }
+        if (cached != null) {
+            return Response.Builder()
+                .request(request)
+                .protocol(Protocol.HTTP_1_1)
+                .code(200)
+                .message("OK")
+                .body(cached.toResponseBody("image/webp".toMediaType()))
+                .build()
+        }
 
-    private fun encryptedPage(chain: Interceptor.Chain, session: EncryptedSession): Response {
-        val request = chain.request()
-        val response = chain.proceed(
-            request.newBuilder().apply { session.siteHeaders.forEach { (name, value) -> header(name, value) } }.build(),
-        )
-        if (!response.isSuccessful) return response
+        val session = request.url.fragment?.let(sessions::get)
+        if (session != null) return signedPage(chain, session)
 
-        return response.newBuilder()
-            .body(
-                Ece.decrypt(response.body.bytes(), session.contentKey)
-                    .toResponseBody("image/webp".toMediaType()),
-            )
-            .build()
+        // A reader v2 page that is no longer cached: reopening the chapter fetches it again in the WebView.
+        if (request.url.pathSegments.firstOrNull() == "p") {
+            throw IOException("Reopen the chapter to reload its pages")
+        }
+        return chain.proceed(request)
     }
 
     private fun signedPage(chain: Interceptor.Chain, session: SignedSession): Response {
@@ -471,9 +449,7 @@ abstract class Pam :
 
 private const val THUMBNAIL_FRAGMENT = "thumbnail"
 private val MANIFEST_BASE_REGEX = Regex("""/p/[\w-]+/\d+/[\w-]+/""")
-private val HEADER_VALUE_REGEX = Regex("""[!-~]+""")
-private val SITE_HEADER_REGEX = Regex("""X-[\w-]+""", RegexOption.IGNORE_CASE)
-private const val MAX_VARIANT_WIDTH = 2160
+private const val MAX_CACHED_PAGES = 60
 private const val HIDE_PREMIUM_PREF = "pref_hide_premium_chapters"
 private const val CHUNK_SIZE = 65536 + 17 // libsodium secretstream chunk + ABYTES
 private const val PREFIX_LENGTH = 192

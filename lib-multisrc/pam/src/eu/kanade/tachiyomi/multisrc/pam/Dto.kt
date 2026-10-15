@@ -143,24 +143,49 @@ class SiteRequest(
     private val chapters: Boolean = false,
 )
 
-/** What site.js and reader.js hand back. */
+/** What site.js hands back. */
 @Serializable
 class SiteMessage(
     val page: JsonObject? = null,
     val fetched: JsonElement? = null,
     val chapters: List<ChapterListItem>? = null,
-    val reader: ReaderResult? = null,
     val error: String? = null,
     val status: Int = 0,
 )
 
-/** What reader.js hands back. */
+/** What reader-read.js hands back each poll: the chapter page and its page count once the reader lays out. */
 @Serializable
+class ReaderState(
+    val s: String,
+    val status: Int = 0,
+    val v2: Boolean = false,
+    val count: Int = 0,
+    val page: JsonObject? = null,
+)
+
+/** reader-drain.js progress: how many encrypted pages reader-pages.js has fetched. */
+@Serializable
+class ReaderPagesStatus(
+    val ready: Int,
+    val total: Int,
+    val error: String? = null,
+)
+
+/** What reader-worker.js reads out of the reader v2 decrypt worker. */
+@Serializable
+class ReaderCapture(
+    @SerialName("k")
+    val contentKey: String,
+    val base: String,
+    val width: Int = 0,
+    val headers: Map<String, String> = emptyMap(),
+)
+
+/** The reader v2 page base, page count and content key. */
 class ReaderResult(
     val manifest: Manifest,
     val contentKey: String,
 ) {
-    @Serializable
     class Manifest(
         val base: String,
         val count: Int,

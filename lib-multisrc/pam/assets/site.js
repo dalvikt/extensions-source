@@ -1,7 +1,7 @@
 // The site's Inertia page data, and the site's own API calls made from that page.
 (bridge, request) => {
     if (window._cf_chl_opt) return "challenge";
-    const post = (result) => window[bridge].post(JSON.stringify(result));
+    const post = (result) => window[bridge].postMessage(JSON.stringify(result));
     // An error page, once it has loaded without turning out to be a challenge.
     const status = performance.getEntriesByType("navigation")[0]?.responseStatus ?? 0;
     if (status >= 400 && document.readyState === "complete") {

@@ -1,5 +1,6 @@
 package eu.kanade.tachiyomi.multisrc.pam
 
+import android.util.Base64
 import android.webkit.WebResourceResponse
 import keiyoushi.utils.WebViewTimeoutException
 import keiyoushi.utils.parseAs
@@ -15,10 +16,7 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import java.io.ByteArrayInputStream
 import java.io.IOException
-import java.io.InputStream
 import java.security.SecureRandom
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
@@ -30,7 +28,8 @@ internal class SitePage(
     val fetched: JsonElement? = null,
     val chapters: List<ChapterListItem>? = null,
     val reader: ReaderResult? = null,
-    val pageHeaders: Map<String, String> = emptyMap(),
+    /** Reader v2 encrypted pages, fetched from the reader page in the WebView, one per page in order. */
+    val pages: List<ByteArray>? = null,
 ) {
     fun fetched() = fetched ?: throw IOException("Missing API response")
 }
@@ -43,9 +42,13 @@ internal class SitePages(
 ) {
     private val baseHttpUrl = baseUrl.toHttpUrl()
 
+    private val siteOrigins = setOf("${baseHttpUrl.scheme}://${baseHttpUrl.host}")
+
     private val mutex = Mutex()
 
     private var lastLoad: TimeMark? = null
+
+    private val secureRandom = SecureRandom()
 
     private class Failure(val at: TimeMark, val challengeClearance: String?)
 
@@ -64,78 +67,52 @@ internal class SitePages(
         return challengeClearance == null || clearance().let { it == null || it == challengeClearance }
     }
 
-    /** Loads [url] and reads its Inertia page data; with [reader], also the reader v2 manifest, page key and page request headers. */
-    suspend fun load(url: String, request: SiteRequest = SiteRequest(), reader: Boolean = false): SitePage = mutex.withLock {
+    /** Fails fast while the site is blocking us, and paces loads like a reader opening pages. */
+    private suspend fun awaitTurn() {
         if (failure?.isActive() == true) throw IOException(SOLVE_IN_WEBVIEW)
         lastLoad?.let { delay(LOAD_INTERVAL - it.elapsedNow()) }
         lastLoad = TimeSource.Monotonic.markNow()
+    }
 
-        val bridge = "k" + ByteArray(8).also(SecureRandom()::nextBytes).joinToString("") { "%02x".format(it) }
+    private fun asset(name: String) = javaClass.getResource("/assets/$name")!!.readText()
+
+    /** Loads [url] and reads its Inertia page data, and the site's own API calls made from that page. */
+    suspend fun load(url: String, request: SiteRequest = SiteRequest()): SitePage = mutex.withLock {
+        awaitTurn()
+
+        val bridge = "k" + randomHex(8)
         val readScript = "(${asset("site.js")})(\"$bridge\", ${request.toJsonString()})"
-        val readerScript = if (reader) "(${asset("reader.js")})(\"$bridge\")" else null
-        var site: SitePage? = null
+        val visibleScript = "(${asset("visible.js")})()"
         var challengePolls = 0
-        val released = CountDownLatch(1)
         val result = try {
             runWebView<SitePage>(timeout = WEBVIEW_TIMEOUT) {
                 userAgent = this@SitePages.userAgent()
                 blockImages = true
-                val lock = Any()
-                var readerV2 = false
-                var readerResult: ReaderResult? = null
-                val pageRequests = mutableListOf<Pair<String, Map<String, String>>>()
-                fun resolveWhenReady() {
-                    val page = site ?: return
-                    if (!readerV2) return resolve(page)
-                    val captured = readerResult ?: return
-                    val pageHeaders = pageRequests.firstOrNull { (path, _) -> path.startsWith(captured.manifest.base) }?.second ?: return
-                    resolve(SitePage(page.page, reader = captured, pageHeaders = pageHeaders))
-                }
-                // Site host and Turnstile only; reader page requests stay open until the WebView closes
                 interceptRequest { webRequest ->
-                    val requestUrl = webRequest.url
-                    val requestHost = requestUrl.host
-                    if (requestHost != null && requestHost != baseHttpUrl.host && requestHost != TURNSTILE_HOST) return@interceptRequest blockedResponse()
-                    val path = requestUrl.path.orEmpty()
+                    val host = webRequest.url.host
+                    if (host != null && host != baseHttpUrl.host && host != TURNSTILE_HOST) return@interceptRequest blockedResponse()
+                    val path = webRequest.url.path.orEmpty()
                     if (UNUSED_PATHS.any(path::startsWith)) return@interceptRequest blockedResponse()
-                    // Styles and fonts only for the reader's fingerprint
-                    if (!reader && STYLE_EXTENSIONS.any(path::endsWith)) return@interceptRequest emptyResponse()
-                    if (!reader || !path.startsWith("/p/")) return@interceptRequest null
-                    synchronized(lock) {
-                        pageRequests += path to webRequest.requestHeaders
-                        resolveWhenReady()
-                    }
-                    heldResponse(released)
+                    if (STYLE_EXTENSIONS.any(path::endsWith)) return@interceptRequest emptyResponse("text/css")
+                    null
                 }
-                jsBridge(bridge) { posted ->
+                webMessageBridge(bridge, siteOrigins) { posted, sender ->
+                    if (sender.isMainFrame == false) return@webMessageBridge
                     val message = posted.parseAs<SiteMessage>()
-                    synchronized(lock) {
-                        when {
-                            message.reader != null -> readerResult = message.reader
-                            message.error != null -> {
-                                if (message.status == 403 || message.status == 429) failed(challenge = false)
-                                return@jsBridge reject(IOException(message.error))
-                            }
-                            else -> {
-                                val page = message.page ?: return@jsBridge reject(IOException("Missing page data"))
-                                readerV2 = reader && page.parseAs<PageListResponse>().props.readerV2
-                                site = SitePage(page, message.fetched, message.chapters)
-                            }
-                        }
-                        resolveWhenReady()
+                    if (message.error != null) {
+                        if (message.status == 403 || message.status == 429) failed(challenge = false)
+                        return@webMessageBridge reject(IOException(message.error))
                     }
-                }
-                if (readerScript != null) {
-                    onPageStarted { evaluateJs(readerScript) }
-                    onPageFinished { evaluateJs(readerScript) }
+                    val page = message.page ?: return@webMessageBridge reject(IOException("Missing page data"))
+                    resolve(SitePage(page, message.fetched, message.chapters))
                 }
                 onReceivedError { webRequest, error ->
                     if (webRequest.isForMainFrame) reject(IOException(error.description.toString()))
                 }
-                // Challenges that pass by themselves take a few seconds; the rest need the user
+                injectAtDocumentStart(visibleScript, siteOrigins)
                 poll(POLL_INTERVAL) {
                     evaluateJs(readScript) {
-                        if (it != "\"challenge\"") {
+                        if (it != CHALLENGE_RESULT) {
                             challengePolls = 0
                         } else if (POLL_INTERVAL * ++challengePolls > CHALLENGE_WAIT) {
                             failed(challenge = true)
@@ -150,43 +127,177 @@ internal class SitePages(
         } catch (e: IOException) {
             throw e
         } catch (e: WebViewTimeoutException) {
-            if (challengePolls > 0) {
-                failed(challenge = true)
-                throw IOException(SOLVE_IN_WEBVIEW, e)
-            }
-            val message = if (site != null) "The site's reader did not load, try opening the chapter in WebView" else "The site's page did not load, try opening it in WebView"
-            throw IOException(message, e)
+            throw challengeOr(challengePolls, "The site's page did not load, try opening it in WebView", e)
         } catch (e: Throwable) {
             throw IOException(e.message, e)
-        } finally {
-            released.countDown()
         }
         failure = null
         result
     }
 
-    private fun asset(name: String) = javaClass.getResource("/assets/$name")!!.readText()
+    /**
+     * Loads the chapter page in a WebView as the site's reader does. For reader v2 it reads the content
+     * key the reader derives (from a wrapper over the decrypt worker) and fetches the encrypted pages
+     * from the page itself, as the reader does, so none of it reaches the site over a non-browser client.
+     */
+    suspend fun loadReader(url: String): SitePage = mutex.withLock {
+        awaitTurn()
 
-    /** A response that never sends its body before [released]. */
-    private fun heldResponse(released: CountDownLatch) = WebResourceResponse(
-        "application/octet-stream",
-        null,
-        200,
-        "OK",
-        emptyMap(),
-        object : InputStream() {
-            override fun read(): Int {
-                try {
-                    released.await(WEBVIEW_TIMEOUT.inWholeSeconds, TimeUnit.SECONDS)
-                } catch (_: InterruptedException) {
+        val readerScript = "(${asset("reader-read.js")})()"
+        val visibleScript = "(${asset("visible.js")})()"
+        var challengePolls = 0
+        val lock = Any()
+        var page: JsonObject? = null
+        var readerV2 = false
+        var pageCount = 0
+        var capture: ReaderCapture? = null
+        var pagesStarted = false
+        var draining = false
+
+        val result = try {
+            runWebView<SitePage>(timeout = READER_TIMEOUT) {
+                userAgent = this@SitePages.userAgent()
+                blockImages = true
+
+                fun drainPages(total: Int) {
+                    val pages = arrayOfNulls<ByteArray>(total)
+                    fun drainFrom(index: Int) {
+                        if (index >= total) {
+                            val manifest = ReaderResult.Manifest(capture!!.base, total, listOf(capture!!.width))
+                            resolve(SitePage(page!!, reader = ReaderResult(manifest, capture!!.contentKey), pages = pages.map { it!! }))
+                            return
+                        }
+                        evaluateJs("(${asset("reader-drain.js")})($index)") { json ->
+                            val encoded = json.takeIf { it != "null" }?.parseAs<String>()
+                                ?: return@evaluateJs reject(IOException("Page ${index + 1} missing"))
+                            pages[index] = Base64.decode(encoded, Base64.DEFAULT)
+                            drainFrom(index + 1)
+                        }
+                    }
+                    drainFrom(0)
                 }
-                return -1
-            }
-        },
-    )
 
-    // Empty stylesheet, not an error
-    private fun emptyResponse() = WebResourceResponse("text/css", null, 200, "OK", null, ByteArrayInputStream(ByteArray(0)))
+                fun advance() = synchronized(lock) {
+                    val props = page ?: return@synchronized
+                    if (!readerV2) return@synchronized resolve(SitePage(props))
+                    val cap = capture ?: return@synchronized
+                    if (pageCount <= 0 || pagesStarted) return@synchronized
+                    pagesStarted = true
+                    val fetch = "(${asset("reader-pages.js")})(${cap.base.toJsonString()}, ${cap.width}, $pageCount, ${cap.headers.toJsonString()})"
+                    evaluateJs(fetch)
+                }
+
+                interceptRequest { webRequest ->
+                    val host = webRequest.url.host
+                    if (host != null && host != baseHttpUrl.host && host != TURNSTILE_HOST) return@interceptRequest blockedResponse()
+                    val path = webRequest.url.path.orEmpty()
+                    // The wrapper re-imports the real worker with this marker; let it through.
+                    if (webRequest.url.getQueryParameter(ORIGINAL_WORKER_PARAM) != null) return@interceptRequest null
+                    if (UNUSED_PATHS.any(path::startsWith)) return@interceptRequest blockedResponse()
+                    if (path.startsWith(CAPTURE_PATH)) {
+                        synchronized(lock) {
+                            if (capture == null) {
+                                capture = runCatching {
+                                    // The path is already percent-decoded
+                                    path.removePrefix(CAPTURE_PATH).parseAs<ReaderCapture>()
+                                }.getOrNull()
+                            }
+                        }
+                        advance()
+                        return@interceptRequest emptyResponse("text/plain")
+                    }
+                    // Serve the decrypt worker through a wrapper that reads the key the site derives.
+                    // A worker's top-level module request carries no Origin, unlike the page's own scripts.
+                    if (WORKER_SCRIPT_REGEX.matches(path) && webRequest.requestHeaders.keys.none { it.equals("Origin", ignoreCase = true) }) {
+                        return@interceptRequest workerWrapper(path.substringAfterLast('/'))
+                    }
+                    null
+                }
+                onReceivedError { webRequest, error ->
+                    if (webRequest.isForMainFrame) reject(IOException(error.description.toString()))
+                }
+                injectAtDocumentStart(visibleScript, siteOrigins)
+                poll(POLL_INTERVAL) {
+                    if (!pagesStarted) {
+                        evaluateJs(readerScript) { json ->
+                            val state = json.takeIf { it != "null" }?.parseAs<ReaderState>() ?: return@evaluateJs
+                            when (state.s) {
+                                "challenge" -> if (POLL_INTERVAL * ++challengePolls > CHALLENGE_WAIT) {
+                                    failed(challenge = true)
+                                    reject(IOException(SOLVE_IN_WEBVIEW))
+                                }
+                                "error" -> {
+                                    if (state.status == 403 || state.status == 429) failed(challenge = false)
+                                    reject(IOException("HTTP error ${state.status}"))
+                                }
+                                "ready" -> {
+                                    synchronized(lock) {
+                                        challengePolls = 0
+                                        page = state.page
+                                        readerV2 = state.v2
+                                        pageCount = state.count
+                                    }
+                                    advance()
+                                }
+                                else -> challengePolls = 0
+                            }
+                        }
+                    } else if (!draining) {
+                        evaluateJs("(${asset("reader-drain.js")})(-1)") { json ->
+                            val status = json.takeIf { it != "null" }?.parseAs<ReaderPagesStatus>() ?: return@evaluateJs
+                            when {
+                                status.error != null -> {
+                                    if (status.error.endsWith("403") || status.error.endsWith("429")) failed(challenge = false)
+                                    reject(IOException(status.error))
+                                }
+                                status.total > 0 && status.ready == status.total -> {
+                                    draining = true
+                                    drainPages(status.total)
+                                }
+                            }
+                        }
+                    }
+                }
+                loadUrl(url)
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: IOException) {
+            throw e
+        } catch (e: WebViewTimeoutException) {
+            throw challengeOr(challengePolls, "The site's reader did not load, try opening the chapter in WebView", e)
+        } catch (e: Throwable) {
+            throw IOException(e.message, e)
+        }
+        failure = null
+        result
+    }
+
+    private fun challengeOr(challengePolls: Int, message: String, cause: Throwable): IOException {
+        if (challengePolls > 0) {
+            failed(challenge = true)
+            return IOException(SOLVE_IN_WEBVIEW, cause)
+        }
+        return IOException(message, cause)
+    }
+
+    private fun workerWrapper(scriptName: String): WebResourceResponse {
+        val wrapper = asset("reader-worker.js")
+            .replace("__REAL_WORKER__", "./$scriptName?$ORIGINAL_WORKER_PARAM=1")
+            .replace("__CAPTURE_PATH__", CAPTURE_PATH)
+        return WebResourceResponse(
+            "text/javascript",
+            "UTF-8",
+            200,
+            "OK",
+            emptyMap(),
+            ByteArrayInputStream(wrapper.toByteArray()),
+        )
+    }
+
+    private fun randomHex(byteCount: Int): String = ByteArray(byteCount).also(secureRandom::nextBytes).joinToString("") { "%02x".format(it) }
+
+    private fun emptyResponse(mimeType: String) = WebResourceResponse(mimeType, null, 200, "OK", null, ByteArrayInputStream(ByteArray(0)))
 
     private fun blockedResponse() = WebResourceResponse("text/plain", null, 403, "Blocked", null, ByteArrayInputStream(ByteArray(0)))
 }
@@ -197,8 +308,14 @@ private val LOAD_INTERVAL = 2.seconds
 private val BACKOFF = 5.minutes
 private val CHALLENGE_WAIT = 15.seconds
 private val WEBVIEW_TIMEOUT = 60.seconds
+private val READER_TIMEOUT = 180.seconds
+
+private const val CHALLENGE_RESULT = "\"challenge\""
 
 // Comment stickers, Cloudflare's prefetch hints, the favicon and the site's analytics
 private val UNUSED_PATHS = listOf("/api/v1/stickers", "/cdn-cgi/speculation", "/favicon.ico", "/gmetrics/")
 private val STYLE_EXTENSIONS = listOf(".css", ".woff2", ".woff", ".ttf")
+private val WORKER_SCRIPT_REGEX = Regex("""/build/assets/[\w-]+\.js""")
+private const val CAPTURE_PATH = "/__pam_capture__/"
+private const val ORIGINAL_WORKER_PARAM = "pam_original"
 private const val SOLVE_IN_WEBVIEW = "Open in WebView to pass the site's verification"
